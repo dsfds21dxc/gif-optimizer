@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-GIF Optimizer API — uses ffmpeg palettegen/paletteuse for maximum quality compression.
-Deploy on Railway, Render, or Fly.io (free tier).
-
-Requirements: pip install flask flask-cors
-System: ffmpeg must be installed (apt-get install ffmpeg)
+GIF Optimizer API v2 — uses ffmpeg 2-pass palettegen/paletteuse.
+Deploy on Railway with Docker.
 """
 
 import os
@@ -15,13 +12,23 @@ from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from your banner maker
+CORS(app)
 
-MAX_SIZE = 20 * 1024 * 1024  # 20MB max upload
+MAX_SIZE = 20 * 1024 * 1024
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "GIF Optimizer API",
+        "version": "2.0",
+        "endpoints": {
+            "/health": "GET - check ffmpeg status",
+            "/optimize": "POST - optimize a GIF (multipart, field: gif)"
+        }
+    })
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
     try:
         result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
         return jsonify({"status": "ok", "ffmpeg": result.stdout.split("\n")[0]})
@@ -30,68 +37,92 @@ def health():
 
 @app.route("/optimize", methods=["POST"])
 def optimize_gif():
-    """
-    Accepts a GIF file, optimizes it with ffmpeg palettegen/paletteuse.
-    Returns the optimized GIF.
-
-    Usage: POST /optimize with multipart form data, field name "gif"
-    Optional query params:
-      - colors: palette size (default 128, max 256)
-      - dither: dithering method (default "sierra2_4a", options: none, bayer, sierra2_4a, floyd_steinberg)
-      - lossy: enable lossy mode for extra compression (default false)
-    """
     if "gif" not in request.files:
-        return jsonify({"error": "No GIF file provided. Send as multipart with field 'gif'"}), 400
+        return jsonify({"error": "No GIF file. Send multipart with field 'gif'"}), 400
 
     gif_file = request.files["gif"]
-    if gif_file.content_length and gif_file.content_length > MAX_SIZE:
-        return jsonify({"error": f"File too large (max {MAX_SIZE // 1024 // 1024}MB)"}), 413
-
     colors = min(256, max(2, int(request.args.get("colors", 128))))
     dither = request.args.get("dither", "sierra2_4a")
+    lossy = request.args.get("lossy", "0")
 
-    # Validate dither method
     valid_dithers = ["none", "bayer", "sierra2_4a", "floyd_steinberg", "heckbert"]
     if dither not in valid_dithers:
         dither = "sierra2_4a"
 
     work_dir = tempfile.mkdtemp()
     uid = str(uuid.uuid4())[:8]
-    input_path = os.path.join(work_dir, f"{uid}_input.gif")
-    palette_path = os.path.join(work_dir, f"{uid}_palette.png")
-    output_path = os.path.join(work_dir, f"{uid}_output.gif")
+    input_path = os.path.join(work_dir, f"{uid}_in.gif")
+    palette_path = os.path.join(work_dir, f"{uid}_pal.png")
+    output_path = os.path.join(work_dir, f"{uid}_out.gif")
 
     try:
-        # Save uploaded GIF
         gif_file.save(input_path)
         input_size = os.path.getsize(input_path)
 
+        # Get input info (fps, dimensions)
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_path],
+            capture_output=True, text=True, timeout=10
+        )
+
         # Pass 1: Generate optimal palette
+        # stats_mode=diff: only count pixels that change between frames
+        # This gives much better palette usage for animations
         palette_cmd = [
             "ffmpeg", "-y", "-i", input_path,
-            "-vf", f"palettegen=max_colors={colors}:stats_mode=diff",
+            "-vf", f"palettegen=max_colors={colors}:stats_mode=diff:reserve_transparent=on",
             palette_path
         ]
-        result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": "Palette generation failed", "detail": result.stderr[-500:]}), 500
+        r1 = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        if r1.returncode != 0:
+            # Fallback: try without reserve_transparent
+            palette_cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", f"palettegen=max_colors={colors}:stats_mode=diff",
+                palette_path
+            ]
+            r1 = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+            if r1.returncode != 0:
+                return jsonify({"error": "Palette generation failed", "detail": r1.stderr[-300:]}), 500
 
-        # Pass 2: Apply palette with dithering
-        dither_opt = f"dither={dither}" if dither != "none" else "dither=none"
+        # Pass 2: Apply palette with optimal settings
         if dither == "bayer":
-            dither_opt = "dither=bayer:bayer_scale=3"
+            dither_str = "dither=bayer:bayer_scale=3"
+        elif dither == "none":
+            dither_str = "dither=none"
+        else:
+            dither_str = f"dither={dither}"
 
+        # diff_mode=rectangle: only re-encode changed rectangular region per frame
+        # This is the KEY optimization that reduces file size dramatically
         optimize_cmd = [
-            "ffmpeg", "-y", "-i", input_path, "-i", palette_path,
-            "-lavfi", f"paletteuse={dither_opt}:diff_mode=rectangle",
-            "-gifflags", "+transdiff",
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-i", palette_path,
+            "-lavfi", f"[0:v][1:v]paletteuse={dither_str}:diff_mode=rectangle",
+            "-loop", "0",
             output_path
         ]
-        result = subprocess.run(optimize_cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            return jsonify({"error": "Optimization failed", "detail": result.stderr[-500:]}), 500
+        r2 = subprocess.run(optimize_cmd, capture_output=True, text=True, timeout=120)
+        if r2.returncode != 0:
+            return jsonify({"error": "Optimization failed", "detail": r2.stderr[-300:]}), 500
 
         output_size = os.path.getsize(output_path)
+
+        # If lossy mode requested, try gifsicle too (if available)
+        if lossy != "0":
+            try:
+                lossy_path = os.path.join(work_dir, f"{uid}_lossy.gif")
+                lossy_val = min(200, max(30, int(lossy)))
+                lr = subprocess.run(
+                    ["gifsicle", "-O3", f"--lossy={lossy_val}", output_path, "-o", lossy_path],
+                    capture_output=True, text=True, timeout=60
+                )
+                if lr.returncode == 0 and os.path.getsize(lossy_path) < output_size:
+                    output_path = lossy_path
+                    output_size = os.path.getsize(lossy_path)
+            except FileNotFoundError:
+                pass  # gifsicle not installed, skip
 
         response = send_file(
             output_path,
@@ -101,20 +132,26 @@ def optimize_gif():
         )
         response.headers["X-Original-Size"] = str(input_size)
         response.headers["X-Optimized-Size"] = str(output_size)
-        response.headers["X-Compression-Ratio"] = f"{output_size/input_size:.2%}"
+        response.headers["X-Savings"] = f"{max(0, 100 - round(output_size/input_size*100))}%"
+        response.headers["Access-Control-Expose-Headers"] = "X-Original-Size, X-Optimized-Size, X-Savings"
 
         return response
 
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Processing timed out (max 120s)"}), 504
+        return jsonify({"error": "Processing timed out"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        # Cleanup
-        for f in [input_path, palette_path, output_path]:
-            try: os.remove(f)
+        for f_path in [input_path, palette_path, output_path]:
+            try: os.remove(f_path)
             except: pass
-        try: os.rmdir(work_dir)
+        try: 
+            # Clean up any lossy file too
+            import glob
+            for f_path in glob.glob(os.path.join(work_dir, "*")):
+                try: os.remove(f_path)
+                except: pass
+            os.rmdir(work_dir)
         except: pass
 
 if __name__ == "__main__":
